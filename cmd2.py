@@ -106,6 +106,8 @@ if six.PY2 and sys.platform.startswith('lin'):
     except ImportError:
         pass
 
+from functools import partial
+
 __version__ = '0.7.9'
 
 # Pyparsing enablePackrat() can greatly speed up parsing, but problems have been seen in Python 3 in the past
@@ -438,6 +440,14 @@ def strip_ansi(text):
     return ANSI_ESCAPE_RE.sub('', text)
 
 
+def toplevel_command(func):
+    """Decorator used to signal that a do_* function is a top level function
+       ie only accessible at the root command scope.
+    """
+    func.toplevel_command = True
+    return func
+
+
 class Cmd(cmd.Cmd):
     """An easy but powerful framework for writing line-oriented command interpreters.
 
@@ -467,6 +477,8 @@ class Cmd(cmd.Cmd):
     reserved_words = []
 
     # Attributes which ARE dynamically settable at runtime
+    custom_prompt = cmd.Cmd.prompt
+    prompt_format = "({prompt} {scopes}) "
     abbrev = False  # Abbreviated commands recognized
     autorun_on_edit = False  # Should files automatically run after editing (doesn't apply to commands)
     colors = (platform.system() != 'Windows')
@@ -525,7 +537,7 @@ class Cmd(cmd.Cmd):
         self.initial_stdout = sys.stdout
         self.history = History()
         self.pystate = {}
-        self.keywords = self.reserved_words + [fname[3:] for fname in dir(self) if fname.startswith('do_')]
+        self.keywords = self.get_keywords()
         self.parser_manager = ParserManager(redirector=self.redirector, terminators=self.terminators,
                                             multilineCommands=self.multilineCommands,
                                             legalChars=self.legalChars, commentGrammars=self.commentGrammars,
@@ -567,6 +579,14 @@ class Cmd(cmd.Cmd):
         # Used when piping command output to a shell command
         self.pipe_proc = None
 
+        # Used for keeping track of subcommands and their scopes
+        self._scope = self
+        self.parent_command = None
+        self._subcommands = {}
+
+        # Create getter/setter for 'prompt' attribute to better show scoping of subcommands.
+        self._rebind_prompt()
+
     # -----  Methods related to presenting output to the user -----
 
     @property
@@ -587,6 +607,159 @@ class Cmd(cmd.Cmd):
 
         # Make sure settable parameters are sorted alphabetically by key
         self.settable = collections.OrderedDict(sorted(self.settable.items(), key=lambda t: t[0]))
+
+    def register_subcommand(self, **cmd_mapping):
+        for command_name, cmd_instance in cmd_mapping.items():
+            if ('do_' + command_name) in dir(self):
+                raise NameError('A command by the name of do_{cmd} already exists'.format(cmd=command_name))
+            self._subcommands[command_name] = cmd_instance
+
+            handler_name = "do_{subcmd}".format(subcmd=command_name)
+            setattr(self.__class__, handler_name, partial(self._enter_subcommand, command_name))
+            cmd_instance.parent_command = self
+        self.keywords = self.get_keywords()
+
+    def _rebind_prompt(self):
+        """Rebinds the 'prompt' attribute to be a property that better represents subcommand scoping.
+
+        For compatibility reasons we need to rebind the prompt attribute after the fact so that if
+        the user changes the value of prompt in the class, it does not override the subcommand handling.
+
+        """
+        @property
+        def prompt(self):
+            """Get the scope formatted prompt string."""
+            prompt = self.custom_prompt
+            if prompt == cmd.Cmd.prompt:
+                prompt = prompt.strip("( )")
+            scopes = self._get_prompt_scopes()
+            return self.prompt_format.format(prompt=prompt, scopes=scopes)
+
+        @prompt.setter
+        def prompt(self, prompt):
+            self.custom_prompt = prompt
+
+        self.custom_prompt = self.prompt
+        self.__class__.prompt = prompt
+
+    def get_keywords(self):
+        """Return a list of keywords for commands.
+
+        Keywords include reserved words and functions that start with "do_".
+
+        :return: list - list of keywords.
+        """
+        return self.reserved_words + [fname[3:] for fname in dir(self) if fname.startswith('do_')]
+
+    def get_scope(self):
+        """Returns the current subcommand scope for this class."""
+        return self._scope
+
+    def get_subcommands(self):
+        """Returns a dictionary of subcommands for this class."""
+        return self._subcommands
+
+    def _enter_subcommand(self, subcmd, line):
+        """Enter a
+
+        :param subcmd:
+        :param line:
+        :return:
+        """
+        if subcmd in self._subcommands:
+            self._scope = self._subcommands[subcmd]
+
+    def exit_subcommand(self):
+        """ Leave the current scope if there is one."""
+        self._scope = self
+
+    def _get_prompt_scopes(self):
+        """Returns a string of scopes showing the path to the subcommand scope that is currently active.
+
+        :return: str - string that consists of separated subcommand scopes.
+        """
+        prompt_scopes = ''
+        scope = self
+        next_scope = self.get_scope()
+        while True:
+            commands = {v: k for (k, v) in scope.get_subcommands().items()}
+            if scope is next_scope:
+                break
+            else:
+                prompt_scopes += " >> {subcmd}".format(subcmd=commands[next_scope])
+                scope = scope.get_scope()
+        return prompt_scopes
+
+    def parse_scope(self, line):
+        """Deconstruct a line into the command name, command class and scoped line.
+        The root command has name ''. If a subcommand exists in line, it must be followed by a space.
+
+        :param line: str - command string
+        :return: tuple - command name (str), command instance (Cmd), scoped line (str)
+        """
+        words = line.split()
+        command = self
+        name = ''
+
+        for word in words:
+            if word in self._subcommands:
+                nextchar = line[line.index(word) + len(word): line.index(word) + len(word) + 1]
+                if nextchar == " ":
+                    name, command = word, self._subcommands[word]
+            else:
+                break
+
+        if name:
+            subcmd_len = len(name) + 1
+        else:
+            subcmd_len = 0
+        scoped_line = line[subcmd_len:]
+
+        return name, command, scoped_line
+
+    def complete(self, text, state):
+        """Return the next possible completion for 'text'.
+
+        If a command has not been entered, then complete against command list.
+        Otherwise try to call complete_<command> to get list of completions.
+        """
+        if self._scope is not self:
+            # Redirect to the subcommand.
+            return self._scope.complete(text, state)
+
+        if state == 0:
+
+            import readline
+            # origline = self.get_line_buffer(subcmd)
+            origline = readline.get_line_buffer()
+
+            subcmd, scope, origline = self.parse_scope(origline)
+            line = origline.lstrip()
+
+            if subcmd:
+                subcmd_len = len(subcmd)+1
+            else:
+                subcmd_len = 0
+
+            stripped = len(origline) - len(line)
+            begidx = readline.get_begidx() - stripped - subcmd_len
+            endidx = readline.get_endidx() - stripped - subcmd_len
+            if begidx>0:
+                cmd, args, foo = scope.parseline(line)
+                if cmd == '':
+                    compfunc = scope.completedefault
+                else:
+                    try:
+                        compfunc = getattr(scope, 'complete_' + cmd)
+                    except AttributeError:
+                        compfunc = scope.completedefault
+            else:
+                compfunc = scope.completenames
+            self.completion_matches = compfunc(text, line, begidx, endidx)
+        try:
+            return self.completion_matches[state]
+        except IndexError:
+            return None
 
     def poutput(self, msg, end='\n'):
         """Convenient shortcut for self.stdout.write(); by default adds newline to end if not already present.
@@ -663,6 +836,11 @@ class Cmd(cmd.Cmd):
 
         # Call super class method.  Need to do it this way for Python 2 and 3 compatibility
         cmd_completion = cmd.Cmd.completenames(self, command)
+
+        if self.parent_command is not None:
+            # We are not at the root scope so filter out any toplevel commands
+            filter_out_toplevel_commands = lambda s: not getattr(getattr(self, "do_"+s), "toplevel_command", False)
+            cmd_completion = list(filter(filter_out_toplevel_commands, cmd_completion))
 
         # If we are completing the initial command name and get exactly 1 result and are at end of line, add a space
         if begidx == 0 and len(cmd_completion) == 1 and endidx == len(line):
@@ -965,13 +1143,29 @@ class Cmd(cmd.Cmd):
         :return: bool - a flag indicating whether the interpretation of commands should stop
         """
         statement = self.parser_manager.parsed(line)
-        funcname = self._func_named(statement.parsed.command)
+        scope = self.get_scope()
+        command = statement.parsed.command
+        if command in scope._subcommands:
+            # Remove the subcommand name and pass the command onto the subcommand handler
+            subcommand_line = statement.full_parsed_statement()[len(command):]
+            if subcommand_line.strip():
+                subcommand_handler = scope._subcommands[command]
+                return subcommand_handler.onecmd(subcommand_line)
+
+        funcname = scope._func_named(statement.parsed.command)
+
         if not funcname:
-            return self.default(statement)
+            return scope.default(statement)
         try:
-            func = getattr(self, funcname)
+            func = getattr(scope, funcname)
         except AttributeError:
-            return self.default(statement)
+            return scope.default(statement)
+
+        # Check if the command was a core command and only execute it if we are in the root scope
+        classfunc = getattr(scope.__class__, funcname)
+        if getattr(classfunc, "toplevel_command", False) and scope is not self:
+            return scope.default(statement)
+
         stop = func(statement)
         return stop
 
@@ -1113,6 +1307,7 @@ class Cmd(cmd.Cmd):
             return stop
 
     # noinspection PyUnusedLocal
+    @toplevel_command
     def do_cmdenvironment(self, args):
         """Summary report of interactive parameters."""
         self.poutput("""
@@ -1131,15 +1326,32 @@ class Cmd(cmd.Cmd):
 
     def do_help(self, arg):
         """List available commands with "help" or detailed help with "help cmd"."""
+        subcmd, scope, arg = self.parse_scope(arg)
         if arg:
             # Getting help for a specific command
-            funcname = self._func_named(arg)
+            funcname = scope._func_named(arg)
             if funcname:
                 # No special behavior needed, delegate to cmd base class do_help()
-                cmd.Cmd.do_help(self, funcname[3:])
+                cmd.Cmd.do_help(scope, funcname[3:])
         else:
             # Show a menu of what commands help can be gotten for
-            self._help_menu()
+            scope._help_menu()
+
+    def complete_help(self, text, line, begidx, endidx):
+        line = line[len("help "):]
+        subcmd, scope, line = self.parse_scope(line)
+
+        if subcmd:
+            subcmd_len = len(subcmd) + 1
+        else:
+            subcmd_len = 0
+
+        begidx -= subcmd_len
+        endidx -= subcmd_len
+        commands = set(scope.completenames(text, line, begidx, endidx))
+        topics = set(a[5:] for a in scope.get_names()
+                     if a.startswith('help_' + text))
+        return list(commands | topics)
 
     def _help_menu(self):
         """Show a list of commands which help can be displayed for.
@@ -1179,6 +1391,7 @@ class Cmd(cmd.Cmd):
         self.print_topics(self.undoc_header, cmds_undoc, 15, 80)
 
     # noinspection PyUnusedLocal
+    @toplevel_command
     def do_shortcuts(self, args):
         """Lists shortcuts (aliases) available."""
         result = "\n".join('%s: %s' % (sc[0], sc[1]) for sc in sorted(self.shortcuts))
@@ -1186,10 +1399,15 @@ class Cmd(cmd.Cmd):
 
     # noinspection PyUnusedLocal
     def do_eof(self, arg):
-        """Called when <Ctrl>-D is pressed."""
+        """Called when <Ctrl>-D is pressed. Exits subcommand scope when not at the root scope."""
         # End of script should not exit app, but <Ctrl>-D should.
-        return self._STOP_AND_EXIT
+        if self.parent_command is None:
+            return self._STOP_AND_EXIT
+        else:
+            print()
+            self.parent_command.exit_subcommand()
 
+    @toplevel_command
     def do_quit(self, arg):
         """Exits this application."""
         self._should_quit = True
@@ -1231,6 +1449,7 @@ class Cmd(cmd.Cmd):
                                                                                                    len(fulloptions)))
         return result
 
+    @toplevel_command
     @options([make_option('-l', '--long', action="store_true", help="describe function of parameter")])
     def do_show(self, arg, opts):
         """Shows value of a parameter."""
@@ -1257,6 +1476,7 @@ class Cmd(cmd.Cmd):
         else:
             raise LookupError("Parameter '%s' not supported (type 'show' for list of parameters)." % param)
 
+    @toplevel_command
     def do_set(self, arg):
         """Sets a settable parameter.
 
@@ -1289,6 +1509,7 @@ class Cmd(cmd.Cmd):
         except (ValueError, AttributeError):
             self.do_show(arg)
 
+    @toplevel_command
     def do_shell(self, command):
         """Execute a command as if at the OS prompt.
 
@@ -1480,6 +1701,7 @@ class Cmd(cmd.Cmd):
             return self.path_complete(text, line, begidx, endidx)
 
     # noinspection PyBroadException
+    @toplevel_command
     def do_py(self, arg):
         """
         py <command>: Executes a Python command.
@@ -1555,6 +1777,7 @@ class Cmd(cmd.Cmd):
         return self._should_quit
 
     # noinspection PyUnusedLocal
+    @toplevel_command
     @options([], arg_desc='<script_path> [script_arguments]')
     def do_pyscript(self, arg, opts=None):
         """\nRuns a python script file inside the console
@@ -1593,6 +1816,7 @@ Paths or arguments that contain spaces must be enclosed in quotes
     # Only include the do_ipy() method if IPython is available on the system
     if ipython_available:
         # noinspection PyMethodMayBeStatic,PyUnusedLocal
+        @toplevel_command
         def do_ipy(self, arg):
             """Enters an interactive IPython shell.
 
@@ -1603,6 +1827,7 @@ Paths or arguments that contain spaces must be enclosed in quotes
             exit_msg = 'Leaving IPython, back to {}'.format(sys.argv[0])
             embed(banner1=banner, exit_msg=exit_msg)
 
+    @toplevel_command
     @options([make_option('-s', '--script', action="store_true", help="Script format; no separation lines"),
               ], arg_desc='(limit on which commands to include)')
     def do_history(self, arg, opts):
@@ -1660,6 +1885,7 @@ Paths or arguments that contain spaces must be enclosed in quotes
         except IndexError:
             return None
 
+    @toplevel_command
     @options([], arg_desc="""[N]|[file_path]
     * N         - Number of command (from history), or `*` for all commands in history (default: last command)
     * file_path - path to a file to open in editor""")
@@ -1734,6 +1960,7 @@ Edited files are run on close if the ``autorun_on_edit`` settable parameter is T
                   pyparsing.Optional(pyparsing.Word(legalChars + '/\\'))("fname") +
                   pyparsing.stringEnd)
 
+    @toplevel_command
     def do_save(self, arg):
         """Saves command(s) from history to file.
 
@@ -1782,6 +2009,7 @@ Edited files are run on close if the ``autorun_on_edit`` settable parameter is T
         else:
             return None
 
+    @toplevel_command
     def do__relative_load(self, file_path):
         """Runs commands in script file that is encoded as either ASCII or UTF-8 text.
 
@@ -1807,11 +2035,13 @@ NOTE: This command is intended to only be used within text file scripts.
         relative_path = os.path.join(self._current_script_dir or '', file_path)
         self.do_load(relative_path)
 
+    @toplevel_command
     def do_eos(self, _):
         """Handles cleanup when a script has finished executing."""
         if self._script_dir:
             self._script_dir.pop()
 
+    @toplevel_command
     def do_load(self, file_path):
         """Runs commands in script file that is encoded as either ASCII or UTF-8 text.
 
@@ -1857,6 +2087,7 @@ Script should contain one command per line, just like command would be typed in 
 
         self._script_dir.append(os.path.dirname(expanded_path))
 
+    @toplevel_command
     def do_run(self, arg):
         """run [arg]: re-runs an earlier command
 
