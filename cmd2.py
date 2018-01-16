@@ -53,6 +53,8 @@ except ImportError:
     # noinspection PyUnresolvedReferences
     from pyperclip import PyperclipException
 
+from functools import partial
+
 # next(it) gets next item of iterator it. This is a replacement for calling it.next() in Python 2 and next(it) in Py3
 from six import next
 
@@ -105,8 +107,6 @@ if six.PY2 and sys.platform.startswith('lin'):
         gtk.set_interactive(0)
     except ImportError:
         pass
-
-from functools import partial
 
 __version__ = '0.7.9'
 
@@ -629,15 +629,15 @@ class Cmd(cmd.Cmd):
         @property
         def prompt(self):
             """Get the scope formatted prompt string."""
-            prompt = self.custom_prompt
-            if prompt == cmd.Cmd.prompt:
-                prompt = prompt.strip("( )")
+            prompttext = self.custom_prompt
+            if prompttext == cmd.Cmd.prompt:
+                prompttext = prompttext.strip("( )")
             scopes = self._get_prompt_scopes()
-            return self.prompt_format.format(prompt=prompt, scopes=scopes)
+            return self.prompt_format.format(prompt=prompttext, scopes=scopes)
 
         @prompt.setter
-        def prompt(self, prompt):
-            self.custom_prompt = prompt
+        def prompt(self, text):
+            self.custom_prompt = text
 
         self.custom_prompt = self.prompt
         self.__class__.prompt = prompt
@@ -745,7 +745,7 @@ class Cmd(cmd.Cmd):
             stripped = len(origline) - len(line)
             begidx = readline.get_begidx() - stripped - subcmd_len
             endidx = readline.get_endidx() - stripped - subcmd_len
-            if begidx>0:
+            if begidx > 0:
                 cmd, args, foo = scope.parseline(line)
                 if cmd == '':
                     compfunc = scope.completedefault
@@ -840,8 +840,11 @@ class Cmd(cmd.Cmd):
 
         if self.parent_command is not None:
             # We are not at the root scope so filter out any toplevel commands
-            filter_out_toplevel_commands = lambda s: not getattr(getattr(self, "do_"+s), "toplevel_command", False)
-            cmd_completion = list(filter(filter_out_toplevel_commands, cmd_completion))
+            def is_toplevel_command(command_name):
+                func = getattr(self, "do_" + command_name)
+                return not getattr(func, "toplevel_command", False)
+
+            cmd_completion = list(filter(is_toplevel_command, cmd_completion))
 
         # If we are completing the initial command name and get exactly 1 result and are at end of line, add a space
         if begidx == 0 and len(cmd_completion) == 1 and endidx == len(line):
@@ -1405,7 +1408,7 @@ class Cmd(cmd.Cmd):
         if self.parent_command is None:
             return self._STOP_AND_EXIT
         else:
-            print()
+            print("")
             self.parent_command.exit_subcommand()
 
     @toplevel_command
