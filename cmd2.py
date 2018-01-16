@@ -478,7 +478,7 @@ class Cmd(cmd.Cmd):
 
     # Attributes which ARE dynamically settable at runtime
     custom_prompt = cmd.Cmd.prompt
-    prompt_format = "({prompt} {scopes}) "
+    prompt_format = "({prompt}{scopes}) "
     abbrev = False  # Abbreviated commands recognized
     autorun_on_edit = False  # Should files automatically run after editing (doesn't apply to commands)
     colors = (platform.system() != 'Windows')
@@ -678,6 +678,7 @@ class Cmd(cmd.Cmd):
 
         :return: str - string that consists of separated subcommand scopes.
         """
+        sep = " >> "
         prompt_scopes = ''
         scope = self
         next_scope = self.get_scope()
@@ -686,7 +687,7 @@ class Cmd(cmd.Cmd):
             if scope is next_scope:
                 break
             else:
-                prompt_scopes += " >> {subcmd}".format(subcmd=commands[next_scope])
+                prompt_scopes += "{sep}{subcmd}".format(sep=sep, subcmd=commands[next_scope])
                 scope = scope.get_scope()
         return prompt_scopes
 
