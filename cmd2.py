@@ -689,6 +689,7 @@ class Cmd(cmd.Cmd):
             else:
                 prompt_scopes += "{sep}{subcmd}".format(sep=sep, subcmd=commands[next_scope])
                 scope = scope.get_scope()
+                next_scope = scope.get_scope()
         return prompt_scopes
 
     def parse_scope(self, line):
@@ -1147,13 +1148,20 @@ class Cmd(cmd.Cmd):
         :return: bool - a flag indicating whether the interpretation of commands should stop
         """
         statement = self.parser_manager.parsed(line)
+
+        # Go through the chain until you find the current scope
         scope = self.get_scope()
+        while scope is not scope.get_scope():
+            scope = scope.get_scope()
+            break
+        subcommands = scope.get_subcommands()
+
         command = statement.parsed.command
-        if command in scope._subcommands:
+        if command in subcommands:
             # Remove the subcommand name and pass the command onto the subcommand handler
             subcommand_line = statement.full_parsed_statement()[len(command):]
             if subcommand_line.strip():
-                subcommand_handler = scope._subcommands[command]
+                subcommand_handler = subcommands[command]
                 return subcommand_handler.onecmd(subcommand_line)
 
         funcname = scope._func_named(statement.parsed.command)
@@ -1407,6 +1415,8 @@ class Cmd(cmd.Cmd):
         # End of script should not exit app, but <Ctrl>-D should.
         if self.parent_command is None:
             return self._STOP_AND_EXIT
+        elif self._scope is not self:
+            return self._scope.do_eof(arg)
         else:
             print("")
             self.parent_command.exit_subcommand()
