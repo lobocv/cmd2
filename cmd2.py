@@ -40,6 +40,8 @@ import sys
 import tempfile
 import traceback
 import unittest
+import types
+
 from code import InteractiveConsole
 from optparse import make_option
 
@@ -502,7 +504,8 @@ class AddSubmenu(object):
                  reformat_prompt="{super_prompt}>> {sub_prompt}",
                  shared_attributes={},
                  require_predefined_shares=True,
-                 create_subclass=False
+                 create_subclass=False,
+                 hide_default_commands=True
                  ):
         """Set up the class decorator
 
@@ -536,6 +539,27 @@ class AddSubmenu(object):
         if reformat_prompt is not None and not isinstance(reformat_prompt, str):
             raise ValueError("reformat_prompt should be either a format string or None")
         self.reformat_prompt = reformat_prompt
+
+        if hide_default_commands:
+            remove_cmds = ('_relative_load', 'cmdenvironment', 'edit',
+                           'history', 'load', 'py', 'pyscript', 'quit', 'run', 'save', 'shell',
+                           'shortcuts')
+            remove_funcs = set()
+            for _cmd in remove_cmds:
+                remove_funcs.update(['do_'+_cmd, 'help_'+_cmd, 'complete_'+_cmd])
+
+            # Monkey-patch the get_names() function to filter out the default cmd2 commands
+            # This is required for auto-completion to not pick up the default commands.
+            def get_names(*args):
+                names = set(cmd.Cmd.get_names(*args))
+                return list(names.difference(remove_funcs))
+            submenu.get_names = types.MethodType(get_names, submenu)
+
+            # Replace the default commands with dummy functions so that you can't call them.
+            def dummy(*args):
+                pass
+            for _cmd in remove_funcs:
+                setattr(submenu, _cmd, types.MethodType(dummy, submenu))
 
         if require_predefined_shares:
             for attr in shared_attributes.keys():
